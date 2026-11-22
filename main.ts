@@ -1,487 +1,434 @@
-// The picture that tastes of one ingredient — make.fun bounty entry.
-// One hero ingredient: RAMEN. A glossy, steaming bowl of tonkotsu-style ramen
-// with a soft jammy egg, chashu, narutomaki and green onions, drawn entirely
-// procedurally: every pixel is computed in this file. No assets, no network,
-// no dependencies beyond the Node standard library.
+// Steaming Ramen — One Bowl, One Ingredient
+// A top-down bowl of ramen, drawn entirely in code with the Node.js
+// standard library only. No images, no network, no randomness:
+// every pixel comes from a seeded generator, so the output is
+// byte-identical on every run.
 //
-// Output: /output/entry.png (1024x1024 PNG, deterministic).
-import { mkdirSync, writeFileSync } from "node:fs";
+// Run:  node main.ts
+// Writes: /output/entry.png  (1024 x 1024, PNG)
+
+import { writeFileSync, mkdirSync } from "node:fs";
 import { deflateSync } from "node:zlib";
 
-const W = 1024;
-const H = 1024;
-
-// ---------------------------------------------------------------------------
-// Deterministic PRNG (mulberry32) — same seed, same picture, every run.
-// ---------------------------------------------------------------------------
-function mulberry32(seed: number) {
+// ------------------------------------------------------------------
+// Seeded generator (mulberry32) — the only source of "randomness".
+// ------------------------------------------------------------------
+function makeRng(seed) {
   let a = seed >>> 0;
-  return () => {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return function next() {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
-const rand = mulberry32(20261123);
+const rng = makeRng(20261123);
+const pick = (lo, hi) => lo + rng() * (hi - lo);
 
-// ---------------------------------------------------------------------------
-// Pixel buffer + drawing primitives (premultiplied-ish straight alpha blend)
-// ---------------------------------------------------------------------------
-type RGB = [number, number, number];
+// ------------------------------------------------------------------
+// Canvas: a flat RGBA buffer plus a handful of tiny paint helpers.
+// ------------------------------------------------------------------
+const W = 1024;
+const H = 1024;
+const buf = Buffer.alloc(W * H * 4); // starts transparent black
 
-const buf = new Uint8Array(W * H * 4);
+function mix(a, b, t) {
+  return a + (b - a) * t;
+}
 
-function setPx(x: number, y: number, c: RGB, a = 1) {
+function dot(x, y, r, g, b, alpha) {
   const xi = Math.round(x);
   const yi = Math.round(y);
   if (xi < 0 || yi < 0 || xi >= W || yi >= H) return;
   const i = (yi * W + xi) * 4;
-  if (a >= 1) {
-    buf[i] = c[0];
-    buf[i + 1] = c[1];
-    buf[i + 2] = c[2];
-    buf[i + 3] = 255;
-  } else {
-    buf[i] = Math.round(buf[i] * (1 - a) + c[0] * a);
-    buf[i + 1] = Math.round(buf[i + 1] * (1 - a) + c[1] * a);
-    buf[i + 2] = Math.round(buf[i + 2] * (1 - a) + c[2] * a);
-    buf[i + 3] = 255;
+  const inv = 1 - alpha;
+  buf[i] = Math.round(buf[i] * inv + r * alpha);
+  buf[i + 1] = Math.round(buf[i + 1] * inv + g * alpha);
+  buf[i + 2] = Math.round(buf[i + 2] * inv + b * alpha);
+  buf[i + 3] = 255;
+}
+
+// Soft filled disc; `feather` px of anti-aliased edge.
+function disc(cx, cy, r, color, alpha = 1, feather = 1.2) {
+  const [cr, cg, cb] = color;
+  const x0 = Math.max(0, Math.floor(cx - r - feather));
+  const x1 = Math.min(W - 1, Math.ceil(cx + r + feather));
+  const y0 = Math.max(0, Math.floor(cy - r - feather));
+  const y1 = Math.min(H - 1, Math.ceil(cy + r + feather));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const d = Math.hypot(x + 0.5 - cx, y + 0.5 - cy);
+      if (d >= r + feather) continue;
+      const edge = d <= r ? 1 : 1 - (d - r) / feather;
+      dot(x, y, cr, cg, cb, alpha * edge);
+    }
   }
 }
 
-function lerp(a: number, b: number, t: number) {
-  return a + (b - a) * t;
+// Filled ellipse with the same soft edge.
+function blob(cx, cy, rx, ry, color, alpha = 1, feather = 1.5) {
+  const [cr, cg, cb] = color;
+  const x0 = Math.max(0, Math.floor(cx - rx - feather));
+  const x1 = Math.min(W - 1, Math.ceil(cx + rx + feather));
+  const y0 = Math.max(0, Math.floor(cy - ry - feather));
+  const y1 = Math.min(H - 1, Math.ceil(cy + ry + feather));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const nx = (x + 0.5 - cx) / rx;
+      const ny = (y + 0.5 - cy) / ry;
+      const d = Math.hypot(nx, ny);
+      if (d >= 1 + feather / Math.max(rx, ry)) continue;
+      const edge = d <= 1 ? 1 : Math.max(0, 1 - (d - 1) * Math.max(rx, ry) / feather);
+      dot(x, y, cr, cg, cb, alpha * edge);
+    }
+  }
 }
 
-function mix(c1: RGB, c2: RGB, t: number): RGB {
-  return [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)];
+// Flat ring between two radii.
+function ring(cx, cy, rInner, rOuter, color, alpha = 1) {
+  const [cr, cg, cb] = color;
+  const x0 = Math.max(0, Math.floor(cx - rOuter - 1));
+  const x1 = Math.min(W - 1, Math.ceil(cx + rOuter + 1));
+  const y0 = Math.max(0, Math.floor(cy - rOuter - 1));
+  const y1 = Math.min(H - 1, Math.ceil(cy + rOuter + 1));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const d = Math.hypot(x + 0.5 - cx, y + 0.5 - cy);
+      if (d < rInner || d > rOuter) continue;
+      dot(x, y, cr, cg, cb, alpha);
+    }
+  }
 }
 
-function fillCircle(cx: number, cy: number, r: number, c: RGB, a = 1) {
+// Radial wash: colour A at the centre fading to colour B at radius r.
+function wash(cx, cy, r, inner, outer, alpha = 1) {
   const x0 = Math.max(0, Math.floor(cx - r));
   const x1 = Math.min(W - 1, Math.ceil(cx + r));
   const y0 = Math.max(0, Math.floor(cy - r));
   const y1 = Math.min(H - 1, Math.ceil(cy + r));
   for (let y = y0; y <= y1; y++) {
     for (let x = x0; x <= x1; x++) {
-      const dx = x - cx;
-      const dy = y - cy;
-      const d = Math.sqrt(dx * dx + dy * dy);
-      if (d <= r) {
-        // soft 1px edge
-        const edge = d > r - 1 ? (r - d) : 1;
-        setPx(x, y, c, a * edge);
+      const d = Math.hypot(x + 0.5 - cx, y + 0.5 - cy);
+      if (d > r) continue;
+      const t = d / r;
+      dot(
+        x, y,
+        mix(inner[0], outer[0], t),
+        mix(inner[1], outer[1], t),
+        mix(inner[2], outer[2], t),
+        alpha,
+      );
+    }
+  }
+}
+
+// A polyline drawn as a chain of small discs — good for wavy noodles
+// and steam ribbons. `clip` optionally rejects points outside a circle.
+function scribble(points, width, color, alpha = 1, clip = null) {
+  for (let s = 0; s < points.length - 1; s++) {
+    const [ax, ay] = points[s];
+    const [bx, by] = points[s + 1];
+    const len = Math.hypot(bx - ax, by - ay);
+    const steps = Math.max(1, Math.ceil(len / 2));
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const x = ax + (bx - ax) * t;
+      const y = ay + (by - ay) * t;
+      if (clip && Math.hypot(x - clip[0], y - clip[1]) > clip[2]) continue;
+      disc(x, y, width / 2, color, alpha, 0.9);
+    }
+  }
+}
+
+// A gentle sine wave across a horizontal span — one noodle strand.
+function noodle(yBase, amp, waves, phase, width, color, alpha, clip) {
+  const pts = [];
+  const span = clip[2] * 2 * 0.96;
+  for (let x = -span / 2; x <= span / 2; x += 6) {
+    const wobble = Math.sin((x / span) * Math.PI * 2 * waves + phase);
+    const wobble2 = Math.sin((x / span) * Math.PI * 2 * (waves * 2.3) + phase * 2) * 0.35;
+    pts.push([clip[0] + x, yBase + (wobble + wobble2) * amp]);
+  }
+  scribble(pts, width, color, alpha, clip);
+}
+
+// Thick straight stroke between two points.
+function bar(x1, y1, x2, y2, width, color, alpha = 1) {
+  const len = Math.hypot(x2 - x1, y2 - y1);
+  const steps = Math.ceil(len / 2);
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    disc(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, width / 2, color, alpha, 1);
+  }
+}
+
+// ------------------------------------------------------------------
+// Palette
+// ------------------------------------------------------------------
+const C = {
+  wallTop: [46, 24, 12],
+  wallBottom: [26, 13, 6],
+  plank: [107, 66, 33],
+  plankDark: [88, 53, 26],
+  plankLight: [126, 80, 42],
+  seam: [58, 34, 16],
+  shadow: [12, 6, 3],
+  bowlRed: [176, 44, 36],
+  bowlRedDeep: [128, 28, 24],
+  rimLight: [228, 92, 70],
+  rimGloss: [244, 150, 128],
+  brothCore: [238, 176, 66],
+  brothEdge: [196, 120, 28],
+  brothDeep: [168, 96, 20],
+  noodle: [243, 219, 141],
+  noodleShade: [216, 178, 92],
+  eggWhite: [253, 246, 232],
+  yolk: [240, 140, 26],
+  yolkHot: [255, 191, 77],
+  chashu: [232, 144, 124],
+  chashuPale: [246, 192, 174],
+  chashuCore: [201, 106, 85],
+  naruto: [255, 248, 240],
+  narutoPink: [232, 106, 138],
+  scallion: [63, 158, 77],
+  scallionDeep: [31, 107, 46],
+  chop: [138, 90, 46],
+  chopLight: [169, 118, 63],
+  steam: [255, 250, 240],
+};
+
+// ------------------------------------------------------------------
+// Scene. Bowl centre (512, 560); broth radius 300; bowl radius 352.
+// ------------------------------------------------------------------
+const CX = 512;
+const CY = 560;
+const BROTH_R = 300;
+const BOWL_R = 352;
+
+// 1 — Room: dark wall fading down, then the wooden table.
+function backdrop() {
+  for (let y = 0; y < H; y++) {
+    const t = y / H;
+    const r = mix(C.wallTop[0], C.wallBottom[0], t);
+    const g = mix(C.wallTop[1], C.wallBottom[1], t);
+    const b = mix(C.wallTop[2], C.wallBottom[2], t);
+    for (let x = 0; x < W; x++) dot(x, y, r, g, b, 1);
+  }
+  // Vignette: darken the corners a touch.
+  wash(CX, 420, 760, [0, 0, 0], [0, 0, 0], 0); // no-op keep structure clear
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const d = Math.hypot(x - CX, y - 430) / 760;
+      if (d > 0.75) dot(x, y, 0, 0, 0, Math.min(0.35, (d - 0.75) * 1.4));
+    }
+  }
+}
+
+function table() {
+  const top = 560;
+  const plankH = 116;
+  for (let p = 0; p < 5; p++) {
+    const y0 = top + p * plankH;
+    const base = p % 2 === 0 ? C.plank : C.plankDark;
+    for (let y = y0; y < Math.min(H, y0 + plankH); y++) {
+      for (let x = 0; x < W; x++) {
+        const grain = Math.sin(x * 0.011 + p * 2.7 + Math.sin(y * 0.05) * 2) * 6;
+        dot(x, y, base[0] + grain, base[1] + grain * 0.7, base[2] + grain * 0.4, 1);
       }
     }
-  }
-}
-
-function fillEllipse(cx: number, cy: number, rx: number, ry: number, c: RGB, a = 1) {
-  const x0 = Math.max(0, Math.floor(cx - rx));
-  const x1 = Math.min(W - 1, Math.ceil(cx + rx));
-  const y0 = Math.max(0, Math.floor(cy - ry));
-  const y1 = Math.min(H - 1, Math.ceil(cy + ry));
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      const dx = (x - cx) / rx;
-      const dy = (y - cy) / ry;
-      if (dx * dx + dy * dy <= 1) setPx(x, y, c, a);
+    // Seam between planks.
+    for (let x = 0; x < W; x++) dot(x, y0, C.seam[0], C.seam[1], C.seam[2], 0.9);
+    // A couple of faint grain streaks per plank.
+    for (let s = 0; s < 5; s++) {
+      const gy = y0 + pick(8, plankH - 8);
+      const pts = [];
+      for (let x = 0; x <= W; x += 14) {
+        pts.push([x, gy + Math.sin(x * 0.02 + p) * 3]);
+      }
+      scribble(pts, 1.6, C.plankLight, 0.16);
     }
   }
 }
 
-// Thick line as a chain of small circles (round caps, smooth joins).
-function thickLine(
-  x0: number, y0: number, x1: number, y1: number,
-  w: number, c: RGB, a = 1,
-) {
-  const len = Math.hypot(x1 - x0, y1 - y0);
-  const steps = Math.max(1, Math.ceil(len / Math.max(1, w / 3)));
-  for (let s = 0; s <= steps; s++) {
-    const t = s / steps;
-    fillCircle(lerp(x0, x1, t), lerp(y0, y1, t), w / 2, c, a);
+// 2 — Soft shadow the bowl casts on the table.
+function bowlShadow() {
+  blob(CX, CY + 300, 330, 52, C.shadow, 0.5, 6);
+  blob(CX, CY + 288, 300, 40, C.shadow, 0.35, 6);
+}
+
+// 3 — The bowl itself: deep red body, glossy rim, golden broth.
+function bowl() {
+  disc(CX, CY, BOWL_R, C.bowlRed, 1, 2);
+  disc(CX, CY, BOWL_R - 14, C.bowlRedDeep, 1, 1.5);
+  ring(CX, CY, BOWL_R - 26, BOWL_R - 14, C.rimLight, 0.95);
+  // Glossy crescent on the upper-left rim.
+  for (let a = Math.PI * 0.95; a < Math.PI * 1.75; a += 0.02) {
+    const x = CX + Math.cos(a) * (BOWL_R - 20);
+    const y = CY + Math.sin(a) * (BOWL_R - 20);
+    disc(x, y, 7, C.rimGloss, 0.55, 2);
+  }
+  // Broth: warm radial wash, lighter where the light pools.
+  wash(CX, CY, BROTH_R, C.brothCore, C.brothEdge, 1);
+  wash(CX - 90, CY - 110, 190, [244, 196, 96], C.brothCore, 0.45);
+  // A few glistening oil beads on the surface.
+  for (let i = 0; i < 26; i++) {
+    const a = rng() * Math.PI * 2;
+    const rr = Math.sqrt(rng()) * (BROTH_R - 40);
+    const x = CX + Math.cos(a) * rr;
+    const y = CY + Math.sin(a) * rr;
+    disc(x, y, pick(3, 9), [255, 214, 120], pick(0.25, 0.5), 1);
   }
 }
 
-// A wavy strand: polyline through sine offsets, drawn thick.
-function wavyLine(
-  x0: number, y0: number, x1: number, y1: number,
-  amp: number, freq: number, phase: number,
-  w: number, c: RGB, a = 1,
-) {
-  const len = Math.hypot(x1 - x0, y1 - y0);
-  const steps = Math.max(8, Math.ceil(len / 4));
-  const dx = (x1 - x0) / len;
-  const dy = (y1 - y0) / len;
-  const px = -dy;
-  const py = dx;
-  let prevX = x0;
-  let prevY = y0;
-  for (let s = 1; s <= steps; s++) {
-    const t = s / steps;
-    const off = Math.sin(t * freq * Math.PI * 2 + phase) * amp;
-    const x = lerp(x0, x1, t) + px * off;
-    const y = lerp(y0, y1, t) + py * off;
-    thickLine(prevX, prevY, x, y, w, c, a);
-    prevX = x;
-    prevY = y;
+// 4 — Noodles: a tangled bed of wavy strands filling the broth.
+function noodles() {
+  const clip = [CX, CY, BROTH_R - 8];
+  // Darker under-strands first, pale strands on top.
+  for (let i = 0; i < 34; i++) {
+    const yBase = CY + pick(-BROTH_R * 0.72, BROTH_R * 0.72);
+    noodle(yBase, pick(7, 15), pick(3, 6), rng() * 6, pick(5, 8), C.noodleShade, 0.85, clip);
   }
-}
-
-// Ring (outline of a circle) with thickness.
-function ring(cx: number, cy: number, r: number, w: number, c: RGB, a = 1) {
-  const x0 = Math.max(0, Math.floor(cx - r - w));
-  const x1 = Math.min(W - 1, Math.ceil(cx + r + w));
-  const y0 = Math.max(0, Math.floor(cy - r - w));
-  const y1 = Math.min(H - 1, Math.ceil(cy + r + w));
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      const d = Math.hypot(x - cx, y - cy);
-      if (Math.abs(d - r) <= w / 2) setPx(x, y, c, a);
+  for (let i = 0; i < 52; i++) {
+    const yBase = CY + pick(-BROTH_R * 0.78, BROTH_R * 0.78);
+    noodle(yBase, pick(6, 14), pick(3, 7), rng() * 6, pick(4.5, 7), C.noodle, 0.95, clip);
+  }
+  // A lifted swirl of noodles near the top, as if just stirred.
+  for (let i = 0; i < 9; i++) {
+    const pts = [];
+    const cx0 = CX - 60 + i * 4;
+    const cy0 = CY - 150 + i * 3;
+    for (let a = 0; a <= Math.PI * 2.2; a += 0.25) {
+      const r = 10 + a * 5.5;
+      pts.push([cx0 + Math.cos(a) * r, cy0 + Math.sin(a) * r * 0.8]);
     }
+    scribble(pts, 5, C.noodle, 0.95, clip);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Scene
-// ---------------------------------------------------------------------------
-const CX = 512;
-const BOWL_Y = 590;
-const BOWL_R = 330;
-const BROTH_R = 268;
-
-function inBroth(x: number, y: number, margin = 0) {
-  return Math.hypot(x - CX, y - BOWL_Y) <= BROTH_R - margin;
+// 5 — Toppings: two soft eggs, chashu, narutomaki, scallions.
+function softEgg(x, y, tilt) {
+  blob(x, y, 62, 56, C.eggWhite, 1, 2);
+  blob(x, y, 56, 50, [255, 252, 244], 0.6, 2);
+  disc(x + tilt, y, 34, C.yolk, 1, 2);
+  disc(x + tilt - 4, y - 5, 26, C.yolkHot, 0.85, 2);
+  disc(x + tilt - 10, y - 12, 7, [255, 232, 170], 0.9, 1.5); // glossy catch-light
+  ring(x + tilt, y, 30, 34, [214, 110, 18], 0.5);
 }
 
-// 1. Background: warm dark gradient + vignette.
-for (let y = 0; y < H; y++) {
-  const t = y / H;
-  const c = mix([38, 20, 11], [16, 9, 5], t);
-  for (let x = 0; x < W; x++) {
-    const i = (y * W + x) * 4;
-    buf[i] = c[0];
-    buf[i + 1] = c[1];
-    buf[i + 2] = c[2];
-    buf[i + 3] = 255;
-  }
-}
-// soft warm glow behind the bowl
-for (let y = 0; y < H; y++) {
-  for (let x = 0; x < W; x++) {
-    const d = Math.hypot(x - CX, y - 480) / 560;
-    if (d < 1) {
-      const g = (1 - d) * (1 - d) * 0.55;
-      const i = (y * W + x) * 4;
-      buf[i] = Math.min(255, buf[i] + 96 * g);
-      buf[i + 1] = Math.min(255, buf[i + 1] + 52 * g);
-      buf[i + 2] = Math.min(255, buf[i + 2] + 18 * g);
+function chashuSlice(x, y, r) {
+  disc(x, y, r, C.chashu, 1, 2);
+  disc(x, y, r * 0.72, C.chashuPale, 0.9, 2);
+  // Fat marbling: a couple of pale curls.
+  for (let i = 0; i < 3; i++) {
+    const pts = [];
+    const a0 = rng() * Math.PI * 2;
+    for (let a = a0; a < a0 + Math.PI * 1.4; a += 0.3) {
+      const rr = r * (0.35 + 0.3 * Math.sin(a * 2));
+      pts.push([x + Math.cos(a) * rr, y + Math.sin(a) * rr]);
     }
+    scribble(pts, 5, C.naruto, 0.75);
+  }
+  disc(x, y, r * 0.3, C.chashuCore, 0.95, 2);
+  disc(x - r * 0.12, y - r * 0.14, 5, [255, 220, 205], 0.8, 1.5);
+}
+
+function narutomaki(x, y, r) {
+  disc(x, y, r, C.naruto, 1, 2);
+  // Pink rim and spiral centre.
+  ring(x, y, r - 6, r - 1, C.narutoPink, 0.9);
+  const pts = [];
+  for (let a = 0; a <= Math.PI * 4.4; a += 0.22) {
+    const rr = 3 + a * 2.4;
+    pts.push([x + Math.cos(a) * rr, y + Math.sin(a) * rr]);
+  }
+  scribble(pts, 4.5, C.narutoPink, 0.95);
+  // Pink speckles around the edge.
+  for (let i = 0; i < 14; i++) {
+    const a = rng() * Math.PI * 2;
+    const rr = r * pick(0.55, 0.85);
+    disc(x + Math.cos(a) * rr, y + Math.sin(a) * rr, pick(2, 4), C.narutoPink, 0.8, 1);
   }
 }
 
-// 2. Wooden table (bottom ~46%) with planks and grain.
-const TABLE_Y = 560;
-for (let y = TABLE_Y; y < H; y++) {
-  const t = (y - TABLE_Y) / (H - TABLE_Y);
-  const base = mix([122, 78, 38], [74, 44, 20], t);
-  for (let x = 0; x < W; x++) {
-    const i = (y * W + x) * 4;
-    buf[i] = base[0];
-    buf[i + 1] = base[1];
-    buf[i + 2] = base[2];
+function scallion(x, y, r) {
+  disc(x, y, r, C.scallion, 1, 1);
+  disc(x, y, r * 0.55, C.scallionDeep, 1, 1);
+  disc(x - r * 0.25, y - r * 0.25, r * 0.22, [140, 220, 120], 0.9, 1);
+}
+
+function toppings() {
+  softEgg(CX - 185, CY + 95, -6);
+  softEgg(CX - 205, CY - 55, 5);
+  chashuSlice(CX + 165, CY - 75, 72);
+  chashuSlice(CX + 205, CY + 35, 62);
+  narutomaki(CX + 195, CY + 165, 48);
+  // Scallion confetti scattered over the noodles.
+  for (let i = 0; i < 34; i++) {
+    const a = rng() * Math.PI * 2;
+    const rr = Math.sqrt(rng()) * (BROTH_R - 45);
+    scallion(CX + Math.cos(a) * rr, CY + Math.sin(a) * rr, pick(6, 10));
+  }
+  // A few chilli-oil flecks for colour.
+  for (let i = 0; i < 12; i++) {
+    const a = rng() * Math.PI * 2;
+    const rr = Math.sqrt(rng()) * (BROTH_R - 60);
+    disc(CX + Math.cos(a) * rr, CY + Math.sin(a) * rr, pick(2.5, 5), [178, 32, 18], 0.75, 1);
   }
 }
-// plank seams + grain lines
-for (let p = 0; p < 4; p++) {
-  const y = TABLE_Y + 46 + p * 118;
-  thickLine(0, y, W, y + (p % 2 === 0 ? 4 : -3), 3, [52, 30, 13], 0.85);
-}
-for (let g = 0; g < 90; g++) {
-  const y = TABLE_Y + 10 + rand() * (H - TABLE_Y - 20);
-  const x0 = rand() * W;
-  const len = 120 + rand() * 420;
-  const dark: RGB = rand() > 0.5 ? [96, 58, 26] : [146, 96, 48];
-  wavyLine(x0, y, x0 + len, y + (rand() - 0.5) * 14, 2.5, 1.5 + rand() * 2, rand() * 6, 1.6, dark, 0.5);
-}
 
-// 3. Soft shadow under the bowl.
-fillEllipse(CX, 968, 360, 42, [0, 0, 0], 0.5);
-fillEllipse(CX, 962, 320, 32, [0, 0, 0], 0.45);
-
-// 4. Bowl: deep red lacquered ceramic, darker at the base.
-for (let y = BOWL_Y - BOWL_R; y <= BOWL_Y + BOWL_R; y++) {
-  for (let x = CX - BOWL_R; x <= CX + BOWL_R; x++) {
-    const d = Math.hypot(x - CX, y - BOWL_Y);
-    if (d <= BOWL_R) {
-      const t = (y - (BOWL_Y - BOWL_R)) / (2 * BOWL_R);
-      const c = mix([168, 46, 34], [74, 16, 12], t);
-      setPx(x, y, c);
+// 6 — Steam: soft ribbons curling up from the hot broth.
+function steam() {
+  for (let s = 0; s < 6; s++) {
+    const x0 = CX - 190 + s * 76 + pick(-14, 14);
+    const top = 130 + pick(0, 60);
+    const pts = [];
+    for (let y = CY - BROTH_R + 40; y >= top; y -= 8) {
+      const rise = (CY - BROTH_R + 40 - y) / (CY - BROTH_R + 40 - top);
+      const sway = Math.sin(y * 0.045 + s * 1.7) * (6 + rise * 22);
+      pts.push([x0 + sway, y]);
     }
-  }
-}
-// bowl foot ring
-fillEllipse(CX, BOWL_Y + BOWL_R - 26, 150, 30, [58, 12, 9], 0.9);
-// rim: thick glossy band
-ring(CX, BOWL_Y, BOWL_R - 12, 26, [196, 62, 44], 1);
-ring(CX, BOWL_Y, BOWL_R - 24, 5, [232, 110, 78], 0.9);
-// rim specular highlight (top-left arc)
-for (let a = Math.PI * 1.05; a <= Math.PI * 1.75; a += 0.004) {
-  const x = CX + Math.cos(a) * (BOWL_R - 12);
-  const y = BOWL_Y + Math.sin(a) * (BOWL_R - 12);
-  fillCircle(x, y, 5, [255, 170, 130], 0.55);
-}
-// inner wall shadow (broth sits in a slight well)
-ring(CX, BOWL_Y, BROTH_R + 8, 10, [60, 18, 8], 0.55);
-
-// 5. Broth: rich golden-orange, lighter in the centre, darker at the edge.
-for (let y = BOWL_Y - BROTH_R; y <= BOWL_Y + BROTH_R; y++) {
-  for (let x = CX - BROTH_R; x <= CX + BROTH_R; x++) {
-    const d = Math.hypot(x - CX, y - BOWL_Y);
-    if (d <= BROTH_R) {
-      const t = d / BROTH_R;
-      const c = mix([243, 178, 84], [196, 116, 30], t * t);
-      setPx(x, y, c);
-    }
-  }
-}
-// broth swirl sheen
-for (let s = 0; s < 7; s++) {
-  const a0 = rand() * Math.PI * 2;
-  const r0 = 60 + rand() * 170;
-  const a1 = a0 + 1.1 + rand() * 1.2;
-  let px = CX + Math.cos(a0) * r0;
-  let py = BOWL_Y + Math.sin(a0) * r0;
-  for (let k = 1; k <= 40; k++) {
-    const t = k / 40;
-    const a = lerp(a0, a1, t);
-    const r = r0 + Math.sin(t * 5) * 8;
-    const x = CX + Math.cos(a) * r;
-    const y = BOWL_Y + Math.sin(a) * r;
-    if (inBroth(x, y, 6)) thickLine(px, py, x, y, 7, [252, 205, 120], 0.28);
-    px = x;
-    py = y;
-  }
-}
-// chilli-oil droplets glistening on the broth
-for (let s = 0; s < 26; s++) {
-  const a = rand() * Math.PI * 2;
-  const r = 30 + rand() * (BROTH_R - 60);
-  const x = CX + Math.cos(a) * r;
-  const y = BOWL_Y + Math.sin(a) * r * 0.95;
-  if (inBroth(x, y, 14)) {
-    fillCircle(x, y, 5 + rand() * 9, [198, 58, 14], 0.75);
-    fillCircle(x - 2, y - 2, 2.5, [255, 140, 70], 0.8);
+    // Draw the ribbon twice: a wide faint pass, then a narrow core.
+    scribble(pts, 24, C.steam, 0.07);
+    scribble(pts, 10, C.steam, 0.10);
   }
 }
 
-// 6. Noodles: a dense tangle of wavy golden strands across the broth.
-const NOODLE_LIGHT: RGB = [250, 222, 138];
-const NOODLE_MID: RGB = [238, 196, 96];
-const NOODLE_DARK: RGB = [214, 164, 62];
-for (let n = 0; n < 64; n++) {
-  const yBase = BOWL_Y - 210 + rand() * 400;
-  const half = Math.sqrt(Math.max(0, (BROTH_R - 18) ** 2 - (yBase - BOWL_Y) ** 2));
-  if (half < 30) continue;
-  const x0 = CX - half + rand() * 30;
-  const x1 = CX + half - rand() * 30;
-  const shade = rand();
-  const c = shade > 0.66 ? NOODLE_LIGHT : shade > 0.33 ? NOODLE_MID : NOODLE_DARK;
-  wavyLine(
-    x0, yBase, x1, yBase + (rand() - 0.5) * 26,
-    7 + rand() * 9, 2 + rand() * 3.5, rand() * 6.28,
-    7 + rand() * 3, c, 0.95,
-  );
-}
-// noodle gloss highlights (a few bright strands on top)
-for (let n = 0; n < 16; n++) {
-  const yBase = BOWL_Y - 180 + rand() * 330;
-  const half = Math.sqrt(Math.max(0, (BROTH_R - 30) ** 2 - (yBase - BOWL_Y) ** 2));
-  if (half < 40) continue;
-  wavyLine(
-    CX - half + 20, yBase, CX + half - 20, yBase + (rand() - 0.5) * 18,
-    6 + rand() * 6, 3 + rand() * 2, rand() * 6.28,
-    2.5, [255, 240, 190], 0.85,
-  );
+// 7 — Chopsticks resting on the rim, upper right.
+function chopsticks() {
+  const x1 = 560, y1 = 268, x2 = 872, y2 = 330;
+  const x3 = 556, y3 = 296, x4 = 868, y4 = 366;
+  bar(x1, y1, x2, y2, 13, C.chop, 1);
+  bar(x1, y1 - 3, x2, y2 - 3, 4, C.chopLight, 0.8);
+  bar(x3, y3, x4, y4, 13, C.chop, 1);
+  bar(x3, y3 - 3, x4, y4 - 3, 4, C.chopLight, 0.8);
+  // Tapered tips.
+  disc(x2, y2, 5, C.chop, 1, 1);
+  disc(x4, y4, 5, C.chop, 1, 1);
 }
 
-// Warm light pooling on the broth, upper-left where the light falls:
-// a broad, very soft glow with a brighter heart, laid over the noodles
-// so the whole surface reads as lit, not just the rim.
-fillEllipse(430, 440, 150, 78, [255, 224, 158], 0.14);
-fillEllipse(430, 440, 78, 40, [255, 238, 190], 0.12);
-
-// 7. Toppings — arranged so the egg is the star, lower-left of centre.
-// --- Chashu (two overlapping pork slices, upper right) ---
-function chashu(cx: number, cy: number, r: number, rot: number) {
-  fillCircle(cx, cy, r, [232, 158, 138], 1);
-  fillCircle(cx, cy, r * 0.82, [214, 128, 106], 1);
-  // fatty marbling
-  for (let k = 0; k < 5; k++) {
-    const a = rot + (k / 5) * Math.PI * 2;
-    const mx = cx + Math.cos(a) * r * 0.45;
-    const my = cy + Math.sin(a) * r * 0.45;
-    fillEllipse(mx, my, r * 0.3, r * 0.14, [248, 214, 196], 0.9);
+// ------------------------------------------------------------------
+// Hand-written PNG encoder (stdlib zlib for the DEFLATE stream).
+// ------------------------------------------------------------------
+const CRC_TABLE = (() => {
+  const table = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c;
   }
-  fillCircle(cx, cy, r * 0.34, [198, 110, 90], 1);
-  // gloss
-  fillEllipse(cx - r * 0.3, cy - r * 0.35, r * 0.3, r * 0.16, [255, 220, 205], 0.5);
-}
-chashu(668, 500, 66, 0.4);
-chashu(716, 566, 58, 1.8);
+  return table;
+})();
 
-// --- Narutomaki (fish cake with pink spiral, right edge) ---
-fillCircle(742, 664, 40, [250, 244, 232], 1);
-ring(742, 664, 40, 3, [226, 200, 180], 0.9);
-for (let k = 0; k < 26; k++) {
-  const t = k / 26;
-  const a = t * Math.PI * 5.2;
-  const r = 4 + t * 30;
-  fillCircle(742 + Math.cos(a) * r, 664 + Math.sin(a) * r, 4.5, [232, 110, 140], 0.95);
-}
-fillCircle(742, 664, 5, [232, 110, 140], 0.95);
-
-// --- Soft egg, two halves, lower-left — the hero. Jammy orange yolks. ---
-function eggHalf(cx: number, cy: number, rx: number, ry: number, rot: number) {
-  // white
-  fillEllipse(cx, cy, rx, ry, [250, 244, 230], 1);
-  fillEllipse(cx, cy, rx * 0.86, ry * 0.86, [243, 234, 214], 1);
-  // yolk: deep orange, glossy, slightly domed
-  fillEllipse(cx, cy, rx * 0.52, ry * 0.52, [244, 140, 16], 1);
-  fillEllipse(cx, cy, rx * 0.4, ry * 0.4, [252, 168, 40], 1);
-  fillEllipse(cx - rx * 0.16, cy - ry * 0.18, rx * 0.2, ry * 0.12, [255, 214, 120], 0.85);
-  // yolk edge shadow for depth
-  ring(cx, cy, rx * 0.52, 3, [214, 110, 8], 0.5);
-  void rot;
-}
-eggHalf(392, 668, 74, 62, 0);
-eggHalf(392, 668, 74, 62, 0); // second pass deepens the white
-// re-draw yolk on top after the second white pass
-fillEllipse(392, 668, 38, 32, [244, 140, 16], 1);
-fillEllipse(392, 668, 29, 24, [252, 168, 40], 1);
-fillEllipse(380, 657, 15, 8, [255, 214, 120], 0.85);
-eggHalf(300, 560, 58, 50, 0);
-fillEllipse(300, 560, 30, 26, [244, 140, 16], 1);
-fillEllipse(300, 560, 23, 19, [252, 168, 40], 1);
-fillEllipse(291, 551, 12, 6, [255, 214, 120], 0.85);
-
-// tiny bright specular dots on each yolk — the wet, just-cracked shine
-// that makes the jammy centres look fresh instead of flat.
-fillCircle(378, 654, 5, [255, 246, 224], 0.95);
-fillCircle(289, 549, 4, [255, 246, 224], 0.95);
-
-// --- Green onions: bright rings scattered over noodles ---
-for (let n = 0; n < 42; n++) {
-  const a = rand() * Math.PI * 2;
-  const r = rand() * (BROTH_R - 46);
-  const x = CX + Math.cos(a) * r;
-  const y = BOWL_Y + Math.sin(a) * r * 0.92;
-  if (!inBroth(x, y, 26)) continue;
-  // keep onions off the egg faces
-  if (Math.hypot(x - 392, y - 668) < 84 || Math.hypot(x - 300, y - 560) < 66) continue;
-  const s = 6 + rand() * 5;
-  fillEllipse(x, y, s, s * 0.8, [58, 148, 58], 0.95);
-  fillEllipse(x, y, s * 0.55, s * 0.45, [140, 210, 90], 0.95);
-  fillEllipse(x, y, s * 0.22, s * 0.18, [30, 96, 36], 0.9);
-}
-
-// --- Sesame seeds ---
-for (let n = 0; n < 60; n++) {
-  const a = rand() * Math.PI * 2;
-  const r = rand() * (BROTH_R - 30);
-  const x = CX + Math.cos(a) * r;
-  const y = BOWL_Y + Math.sin(a) * r * 0.92;
-  if (!inBroth(x, y, 20)) continue;
-  if (Math.hypot(x - 392, y - 668) < 84 || Math.hypot(x - 300, y - 560) < 66) continue;
-  fillEllipse(x, y, 4.5, 2.4, [252, 238, 210], 0.95);
-}
-
-// 8. Steam: soft, diffuse wisps that curl and fade as they rise.
-// Each wisp is drawn as many large, very low-alpha overlapping discs
-// along a wandering S-curve, so no hard edges or beaded segments show —
-// like real vapour catching the light. A brighter thin core thread
-// inside each puff gives it shape without a hard outline.
-function steamWisp(xBase: number, drift: number, phase: number, peak: number, width: number) {
-  const baseY = BOWL_Y - BROTH_R + 34; // just above the broth
-  const rise = 235 + rand() * 75;
-  const steps = 64;
-  for (let k = 1; k <= steps; k++) {
-    const t = k / steps;
-    // wander: one slow S-curve that widens as it rises, plus a gentle ripple
-    const sway = Math.sin(t * 2.6 + phase) * (10 + t * 26) + Math.sin(t * 6.5 + phase * 2.3) * 5;
-    const x = xBase + drift * t + sway;
-    const y = baseY - t * rise;
-    // puff radius swells mid-rise, then thins as the steam disperses
-    const r = width * (0.55 + 0.75 * Math.sin(Math.PI * Math.min(1, t * 1.15)));
-    // alpha: strongest low down, fading to nothing at the top
-    const a = peak * (1 - t) * (1 - t);
-    fillCircle(x, y, r, [255, 248, 238], a);
-    // brighter, thinner core thread inside the puff
-    fillCircle(x + Math.sin(t * 5 + phase) * 4, y, r * 0.45, [255, 252, 246], a * 0.9);
-  }
-}
-// a faint wide haze behind the wisps, for volume
-for (let s = 0; s < 3; s++) {
-  const xBase = CX - 90 + s * 90 + (rand() - 0.5) * 30;
-  const baseY = BOWL_Y - BROTH_R + 40;
-  for (let k = 1; k <= 40; k++) {
-    const t = k / 40;
-    const x = xBase + Math.sin(t * 2.2 + s * 2.1) * (8 + t * 18);
-    const y = baseY - t * 220;
-    fillCircle(x, y, 34 + t * 10, [255, 246, 232], 0.018 * (1 - t));
-  }
-}
-for (let s = 0; s < 6; s++) {
-  steamWisp(
-    CX - 140 + s * 56 + (rand() - 0.5) * 18,
-    (rand() - 0.5) * 36,
-    rand() * 6.28,
-    0.05 + rand() * 0.02,
-    15 + rand() * 8,
-  );
-}
-
-// 9. Chopsticks resting on the rim, top right.
-thickLine(560, 262, 900, 330, 13, [96, 52, 22], 1);
-thickLine(556, 282, 896, 350, 13, [116, 66, 28], 1);
-thickLine(560, 262, 900, 330, 4, [150, 96, 48], 0.7);
-thickLine(556, 282, 896, 350, 4, [170, 112, 58], 0.7);
-
-// 10. Final polish: gentle vignette (smooth, so the PNG stays small).
-for (let y = 0; y < H; y++) {
-  for (let x = 0; x < W; x++) {
-    const dx = (x - CX) / (W / 2);
-    const dy = (y - H / 2) / (H / 2);
-    const d = Math.sqrt(dx * dx + dy * dy);
-    if (d > 0.75) {
-      const vig = 1 - (d - 0.75) * 0.55;
-      const i = (y * W + x) * 4;
-      buf[i] = Math.max(0, Math.min(255, buf[i] * vig));
-      buf[i + 1] = Math.max(0, Math.min(255, buf[i + 1] * vig));
-      buf[i + 2] = Math.max(0, Math.min(255, buf[i + 2] * vig));
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// PNG encoding (hand-written: IHDR, IDAT via zlib, IEND; CRC32)
-// ---------------------------------------------------------------------------
-const CRC_TABLE = new Int32Array(256);
-for (let n = 0; n < 256; n++) {
-  let c = n;
-  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-  CRC_TABLE[n] = c;
-}
-function crc32(data: Buffer): number {
+function crc32(bytes) {
   let c = 0xffffffff;
-  for (let i = 0; i < data.length; i++) {
-    c = CRC_TABLE[(c ^ data[i]) & 0xff] ^ (c >>> 8);
+  for (let i = 0; i < bytes.length; i++) {
+    c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
   }
   return (c ^ 0xffffffff) >>> 0;
 }
-function chunk(type: string, data: Buffer): Buffer {
+
+function chunk(type, data) {
   const out = Buffer.alloc(12 + data.length);
   out.writeUInt32BE(data.length, 0);
   out.write(type, 4, "ascii");
@@ -490,32 +437,45 @@ function chunk(type: string, data: Buffer): Buffer {
   return out;
 }
 
-function encodePng(): Buffer {
-  // RGB (colour type 2): alpha is always opaque, so dropping it saves ~25%.
+function encodePng() {
   const raw = Buffer.alloc(H * (1 + W * 3));
   for (let y = 0; y < H; y++) {
     raw[y * (1 + W * 3)] = 0; // filter: none
     for (let x = 0; x < W; x++) {
-      const s = (y * W + x) * 4;
-      const d = y * (1 + W * 3) + 1 + x * 3;
-      raw[d] = buf[s];
-      raw[d + 1] = buf[s + 1];
-      raw[d + 2] = buf[s + 2];
+      const src = (y * W + x) * 4;
+      const dst = y * (1 + W * 3) + 1 + x * 3;
+      raw[dst] = buf[src];
+      raw[dst + 1] = buf[src + 1];
+      raw[dst + 2] = buf[src + 2];
     }
   }
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(W, 0);
   ihdr.writeUInt32BE(H, 4);
   ihdr[8] = 8; // bit depth
-  ihdr[9] = 2; // colour type RGB
-  ihdr[10] = 0;
-  ihdr[11] = 0;
-  ihdr[12] = 0;
-  const idat = deflateSync(raw, { level: 9 });
-  const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-  return Buffer.concat([sig, chunk("IHDR", ihdr), chunk("IDAT", idat), chunk("IEND", Buffer.alloc(0))]);
+  ihdr[9] = 2; // colour type: truecolour RGB
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", deflateSync(raw, { level: 9 })),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+  return png;
 }
 
+// ------------------------------------------------------------------
+// Paint the scene, encode, write.
+// ------------------------------------------------------------------
+backdrop();
+table();
+bowlShadow();
+bowl();
+noodles();
+toppings();
+steam();
+chopsticks();
+
 mkdirSync("/output", { recursive: true });
-writeFileSync("/output/entry.png", encodePng());
-console.log("wrote /output/entry.png");
+const png = encodePng();
+writeFileSync("/output/entry.png", png);
+console.log(`wrote /output/entry.png — ${png.length} bytes, ${W}x${H}`);
