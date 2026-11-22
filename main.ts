@@ -307,6 +307,12 @@ for (let n = 0; n < 16; n++) {
   );
 }
 
+// Warm light pooling on the broth, upper-left where the light falls:
+// a broad, very soft glow with a brighter heart, laid over the noodles
+// so the whole surface reads as lit, not just the rim.
+fillEllipse(430, 440, 150, 78, [255, 224, 158], 0.14);
+fillEllipse(430, 440, 78, 40, [255, 238, 190], 0.12);
+
 // 7. Toppings — arranged so the egg is the star, lower-left of centre.
 // --- Chashu (two overlapping pork slices, upper right) ---
 function chashu(cx: number, cy: number, r: number, rot: number) {
@@ -361,6 +367,11 @@ fillEllipse(300, 560, 30, 26, [244, 140, 16], 1);
 fillEllipse(300, 560, 23, 19, [252, 168, 40], 1);
 fillEllipse(291, 551, 12, 6, [255, 214, 120], 0.85);
 
+// tiny bright specular dots on each yolk — the wet, just-cracked shine
+// that makes the jammy centres look fresh instead of flat.
+fillCircle(378, 654, 5, [255, 246, 224], 0.95);
+fillCircle(289, 549, 4, [255, 246, 224], 0.95);
+
 // --- Green onions: bright rings scattered over noodles ---
 for (let n = 0; n < 42; n++) {
   const a = rand() * Math.PI * 2;
@@ -387,19 +398,49 @@ for (let n = 0; n < 60; n++) {
   fillEllipse(x, y, 4.5, 2.4, [252, 238, 210], 0.95);
 }
 
-// 8. Steam: soft, wide, gently drifting columns above the bowl.
-for (let s = 0; s < 7; s++) {
-  const xBase = CX - 150 + s * 50 + (rand() - 0.5) * 14;
-  let px = xBase;
-  let py = BOWL_Y - BROTH_R + 30;
-  for (let k = 1; k <= 26; k++) {
-    const t = k / 26;
-    const y = (BOWL_Y - BROTH_R + 30) - t * 260;
-    const x = xBase + Math.sin(t * 3.2 + s * 1.9) * (8 + t * 16);
-    thickLine(px, py, x, y, 34 - t * 14, [255, 246, 232], 0.07);
-    px = x;
-    py = y;
+// 8. Steam: soft, diffuse wisps that curl and fade as they rise.
+// Each wisp is drawn as many large, very low-alpha overlapping discs
+// along a wandering S-curve, so no hard edges or beaded segments show —
+// like real vapour catching the light. A brighter thin core thread
+// inside each puff gives it shape without a hard outline.
+function steamWisp(xBase: number, drift: number, phase: number, peak: number, width: number) {
+  const baseY = BOWL_Y - BROTH_R + 34; // just above the broth
+  const rise = 235 + rand() * 75;
+  const steps = 64;
+  for (let k = 1; k <= steps; k++) {
+    const t = k / steps;
+    // wander: one slow S-curve that widens as it rises, plus a gentle ripple
+    const sway = Math.sin(t * 2.6 + phase) * (10 + t * 26) + Math.sin(t * 6.5 + phase * 2.3) * 5;
+    const x = xBase + drift * t + sway;
+    const y = baseY - t * rise;
+    // puff radius swells mid-rise, then thins as the steam disperses
+    const r = width * (0.55 + 0.75 * Math.sin(Math.PI * Math.min(1, t * 1.15)));
+    // alpha: strongest low down, fading to nothing at the top
+    const a = peak * (1 - t) * (1 - t);
+    fillCircle(x, y, r, [255, 248, 238], a);
+    // brighter, thinner core thread inside the puff
+    fillCircle(x + Math.sin(t * 5 + phase) * 4, y, r * 0.45, [255, 252, 246], a * 0.9);
   }
+}
+// a faint wide haze behind the wisps, for volume
+for (let s = 0; s < 3; s++) {
+  const xBase = CX - 90 + s * 90 + (rand() - 0.5) * 30;
+  const baseY = BOWL_Y - BROTH_R + 40;
+  for (let k = 1; k <= 40; k++) {
+    const t = k / 40;
+    const x = xBase + Math.sin(t * 2.2 + s * 2.1) * (8 + t * 18);
+    const y = baseY - t * 220;
+    fillCircle(x, y, 34 + t * 10, [255, 246, 232], 0.018 * (1 - t));
+  }
+}
+for (let s = 0; s < 6; s++) {
+  steamWisp(
+    CX - 140 + s * 56 + (rand() - 0.5) * 18,
+    (rand() - 0.5) * 36,
+    rand() * 6.28,
+    0.05 + rand() * 0.02,
+    15 + rand() * 8,
+  );
 }
 
 // 9. Chopsticks resting on the rim, top right.
